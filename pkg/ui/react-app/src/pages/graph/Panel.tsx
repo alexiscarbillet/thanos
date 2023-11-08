@@ -328,6 +328,10 @@ class Panel extends Component<PanelProps & PathPrefixProps, PanelState> {
     this.setOptions({ stacked: stacked });
   };
 
+  handleTimeRangeSelection = (startTime: number, endTime: number) => {
+    this.setOptions({ range: endTime - startTime, endTime: endTime });
+  };
+
   handleChangeDeduplication = (event: React.ChangeEvent<HTMLInputElement>): void => {
     this.setOptions({ useDeduplication: event.target.checked });
   };
@@ -673,6 +677,7 @@ class Panel extends Component<PanelProps & PathPrefixProps, PanelState> {
                       stacked={options.stacked}
                       useLocalTime={this.props.useLocalTime}
                       lastQueryParams={this.state.lastQueryParams}
+                      handleTimeRangeSelection={this.handleTimeRangeSelection}
                     />
                   </>
                 )}

@@ -79,7 +79,7 @@ class TimeInput extends Component<TimeInputProps> {
     });
 
     this.$time.on('change.datetimepicker', (e: any) => {
-      if (e.date) {
+      if (e.date && e.date.valueOf() !== Math.trunc(this.props.time?.valueOf()!)) {
         this.props.onChangeTime(e.date.valueOf());
       }
     });

@@ -9,9 +9,10 @@ interface GraphTabContentProps {
   stacked: boolean;
   useLocalTime: boolean;
   lastQueryParams: QueryParams | null;
+  handleTimeRangeSelection: (startTime: number, endTime: number) => void;
 }
 
-export const GraphTabContent: FC<GraphTabContentProps> = ({ data, stacked, useLocalTime, lastQueryParams }) => {
+export const GraphTabContent: FC<GraphTabContentProps> = ({ data, stacked, useLocalTime, lastQueryParams, handleTimeRangeSelection }) => {
   if (!isPresent(data)) {
     return <UncontrolledAlert color="light">No data queried yet</UncontrolledAlert>;
   }
@@ -25,5 +26,5 @@ export const GraphTabContent: FC<GraphTabContentProps> = ({ data, stacked, useLo
       </UncontrolledAlert>
     );
   }
-  return <Graph data={data} stacked={stacked} useLocalTime={useLocalTime} queryParams={lastQueryParams} />;
+  return <Graph data={data} stacked={stacked} useLocalTime={useLocalTime} queryParams={lastQueryParams} handleTimeRangeSelection={handleTimeRangeSelection} />;
 };
