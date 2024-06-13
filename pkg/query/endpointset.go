@@ -13,15 +13,16 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/thanos-io/thanos/pkg/api/query/querypb"
-
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/prometheus/model/labels"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
+	"github.com/thanos-io/thanos/pkg/api/query/querypb"
 	"github.com/thanos-io/thanos/pkg/component"
 	"github.com/thanos-io/thanos/pkg/exemplars/exemplarspb"
 	"github.com/thanos-io/thanos/pkg/info/infopb"
@@ -74,7 +75,11 @@ func (es *GRPCEndpointSpec) Addr() string {
 func (es *endpointRef) Metadata(ctx context.Context, infoClient infopb.InfoClient, storeClient storepb.StoreClient) (*endpointMetadata, error) {
 	if infoClient != nil {
 		resp, err := infoClient.Info(ctx, &infopb.InfoRequest{}, grpc.WaitForReady(true))
-		if err == nil {
+		if err != nil {
+			if status.Convert(err).Code() != codes.Unimplemented {
+				return nil, err
+			}
+		} else {
 			return &endpointMetadata{resp}, nil
 		}
 	}
@@ -197,15 +202,17 @@ type endpointSetNodeCollector struct {
 	storeNodes      map[component.Component]map[string]int
 	storePerExtLset map[string]int
 
+	logger          log.Logger
 	connectionsDesc *prometheus.Desc
 	labels          []string
 }
 
-func newEndpointSetNodeCollector(labels ...string) *endpointSetNodeCollector {
+func newEndpointSetNodeCollector(logger log.Logger, labels ...string) *endpointSetNodeCollector {
 	if len(labels) == 0 {
 		labels = []string{string(ExternalLabels), string(StoreType)}
 	}
 	return &endpointSetNodeCollector{
+		logger:     logger,
 		storeNodes: map[component.Component]map[string]int{},
 		connectionsDesc: prometheus.NewDesc(
 			"thanos_store_nodes_grpc_connections",
@@ -272,7 +279,12 @@ func (c *endpointSetNodeCollector) Collect(ch chan<- prometheus.Metric) {
 					lbls = append(lbls, storeTypeStr)
 				}
 			}
-			ch <- prometheus.MustNewConstMetric(c.connectionsDesc, prometheus.GaugeValue, float64(occurrences), lbls...)
+			select {
+			case ch <- prometheus.MustNewConstMetric(c.connectionsDesc, prometheus.GaugeValue, float64(occurrences), lbls...):
+			case <-time.After(1 * time.Second):
+				level.Warn(c.logger).Log("msg", "failed to collect endpointset metrics", "timeout", 1*time.Second)
+				return
+			}
 		}
 	}
 }
@@ -307,14 +319,14 @@ type nowFunc func() time.Time
 func NewEndpointSet(
 	now nowFunc,
 	logger log.Logger,
-	reg *prometheus.Registry,
+	reg prometheus.Registerer,
 	endpointSpecs func() []*GRPCEndpointSpec,
 	dialOpts []grpc.DialOption,
 	unhealthyEndpointTimeout time.Duration,
 	endpointInfoTimeout time.Duration,
 	endpointMetricLabels ...string,
 ) *EndpointSet {
-	endpointsMetric := newEndpointSetNodeCollector(endpointMetricLabels...)
+	endpointsMetric := newEndpointSetNodeCollector(logger, endpointMetricLabels...)
 	if reg != nil {
 		reg.MustRegister(endpointsMetric)
 	}
@@ -386,8 +398,7 @@ func (e *EndpointSet) Update(ctx context.Context) {
 			defer wg.Done()
 			ctx, cancel := context.WithTimeout(ctx, e.endpointInfoTimeout)
 			defer cancel()
-
-			newRef, err := e.newEndpointRef(ctx, spec)
+			newRef, err := e.newEndpointRef(spec)
 			if err != nil {
 				level.Warn(e.logger).Log("msg", "new endpoint creation failed", "err", err, "address", spec.Addr())
 				return
@@ -520,6 +531,7 @@ func (e *EndpointSet) GetStoreClients() []store.Client {
 				StoreClient: storepb.NewStoreClient(er.cc),
 				addr:        er.addr,
 				metadata:    er.metadata,
+				status:      er.status,
 			})
 			er.mtx.RUnlock()
 		}
@@ -644,17 +656,12 @@ type endpointRef struct {
 
 // newEndpointRef creates a new endpointRef with a gRPC channel to the given the IP address.
 // The call to newEndpointRef will return an error if establishing the channel fails.
-func (e *EndpointSet) newEndpointRef(ctx context.Context, spec *GRPCEndpointSpec) (*endpointRef, error) {
+func (e *EndpointSet) newEndpointRef(spec *GRPCEndpointSpec) (*endpointRef, error) {
 	var dialOpts []grpc.DialOption
 
 	dialOpts = append(dialOpts, e.dialOpts...)
 	dialOpts = append(dialOpts, spec.dialOpts...)
-	// By default DialContext is non-blocking which means that any connection
-	// failure won't be reported/logged. Instead block until the connection is
-	// successfully established and return the details of the connection error
-	// if any.
-	dialOpts = append(dialOpts, grpc.WithReturnConnectionError())
-	conn, err := grpc.DialContext(ctx, spec.Addr(), dialOpts...)
+	conn, err := grpc.NewClient(spec.Addr(), dialOpts...)
 	if err != nil {
 		return nil, errors.Wrap(err, "dialing connection")
 	}
@@ -780,7 +787,7 @@ func (er *endpointRef) LabelSets() []labels.Labels {
 	er.mtx.RLock()
 	defer er.mtx.RUnlock()
 
-	return er.labelSets()
+	return er.status.LabelSets
 }
 
 func (er *endpointRef) labelSets() []labels.Labels {

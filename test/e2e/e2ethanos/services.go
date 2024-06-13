@@ -29,8 +29,8 @@ import (
 	"github.com/thanos-io/objstore/exthttp"
 
 	"github.com/thanos-io/thanos/pkg/alert"
-	"github.com/thanos-io/thanos/pkg/httpconfig"
-
+	apiv1 "github.com/thanos-io/thanos/pkg/api/query"
+	"github.com/thanos-io/thanos/pkg/clientconfig"
 	"github.com/thanos-io/thanos/pkg/queryfrontend"
 	"github.com/thanos-io/thanos/pkg/receive"
 )
@@ -254,8 +254,9 @@ type QuerierBuilder struct {
 	endpoints               []string
 	strictEndpoints         []string
 
-	engine    string
-	queryMode string
+	engine           apiv1.PromqlEngineType
+	queryMode        string
+	enableXFunctions bool
 
 	replicaLabels []string
 	tracingConfig string
@@ -264,8 +265,11 @@ type QuerierBuilder struct {
 	telemetrySamplesQuantiles  []float64
 	telemetrySeriesQuantiles   []float64
 
+	enforceTenancy bool
+
 	e2e.Linkable
-	f e2e.FutureRunnable
+	f             e2e.FutureRunnable
+	relabelConfig string
 }
 
 func NewQuerierBuilder(e e2e.Environment, name string, storeAddresses ...string) *QuerierBuilder {
@@ -363,13 +367,18 @@ func (q *QuerierBuilder) WithDisablePartialResponses(disable bool) *QuerierBuild
 	return q
 }
 
-func (q *QuerierBuilder) WithEngine(engine string) *QuerierBuilder {
+func (q *QuerierBuilder) WithEngine(engine apiv1.PromqlEngineType) *QuerierBuilder {
 	q.engine = engine
 	return q
 }
 
 func (q *QuerierBuilder) WithQueryMode(mode string) *QuerierBuilder {
 	q.queryMode = mode
+	return q
+}
+
+func (q *QuerierBuilder) WithEnableXFunctions() *QuerierBuilder {
+	q.enableXFunctions = true
 	return q
 }
 
@@ -382,6 +391,16 @@ func (q *QuerierBuilder) WithTelemetryQuantiles(duration []float64, samples []fl
 	q.telemetryDurationQuantiles = duration
 	q.telemetrySamplesQuantiles = samples
 	q.telemetrySeriesQuantiles = series
+	return q
+}
+
+func (q *QuerierBuilder) WithTenancy(enforceTenancy bool) *QuerierBuilder {
+	q.enforceTenancy = enforceTenancy
+	return q
+}
+
+func (q *QuerierBuilder) WithSelectorRelabelConfig(relabelConfig string) *QuerierBuilder {
+	q.relabelConfig = relabelConfig
 	return q
 }
 
@@ -485,6 +504,22 @@ func (q *QuerierBuilder) collectArgs() ([]string, error) {
 	for _, bucket := range q.telemetrySeriesQuantiles {
 		args = append(args, "--query.telemetry.request-series-seconds-quantiles="+strconv.FormatFloat(bucket, 'f', -1, 64))
 	}
+	if q.enforceTenancy {
+		args = append(args, "--query.enforce-tenancy")
+	}
+	if q.enableXFunctions {
+		args = append(args, "--query.enable-x-functions")
+	}
+	if q.queryMode != "" {
+		args = append(args, "--query.mode="+q.queryMode)
+	}
+	if q.engine != "" {
+		args = append(args, "--query.promql-engine="+string(q.engine))
+	}
+	if q.relabelConfig != "" {
+		args = append(args, "--selector.relabel-config="+q.relabelConfig)
+	}
+
 	return args, nil
 }
 
@@ -515,6 +550,7 @@ type ReceiveBuilder struct {
 	image               string
 	nativeHistograms    bool
 	labels              []string
+	tenantSplitLabel    string
 }
 
 func NewReceiveBuilder(e e2e.Environment, name string) *ReceiveBuilder {
@@ -553,6 +589,11 @@ func (r *ReceiveBuilder) WithLabel(name, value string) *ReceiveBuilder {
 func (r *ReceiveBuilder) WithRouting(replication int, hashringConfigs ...receive.HashringConfig) *ReceiveBuilder {
 	r.hashringConfigs = hashringConfigs
 	r.replication = replication
+	return r
+}
+
+func (r *ReceiveBuilder) WithTenantSplitLabel(splitLabel string) *ReceiveBuilder {
+	r.tenantSplitLabel = splitLabel
 	return r
 }
 
@@ -595,6 +636,10 @@ func (r *ReceiveBuilder) Init() *e2eobs.Observable {
 		"--tsdb.path":            filepath.Join(r.InternalDir(), "data"),
 		"--log.level":            infoLogLevel,
 		"--tsdb.max-exemplars":   fmt.Sprintf("%v", r.maxExemplars),
+	}
+
+	if r.tenantSplitLabel != "" {
+		args["--receive.split-tenant-label-name"] = r.tenantSplitLabel
 	}
 
 	if len(r.labels) > 0 {
@@ -735,15 +780,15 @@ func (r *RulerBuilder) WithRestoreIgnoredLabels(labels ...string) *RulerBuilder 
 	return r
 }
 
-func (r *RulerBuilder) InitTSDB(internalRuleDir string, queryCfg []httpconfig.Config) *e2eobs.Observable {
+func (r *RulerBuilder) InitTSDB(internalRuleDir string, queryCfg []clientconfig.Config) *e2eobs.Observable {
 	return r.initRule(internalRuleDir, queryCfg, nil)
 }
 
-func (r *RulerBuilder) InitStateless(internalRuleDir string, queryCfg []httpconfig.Config, remoteWriteCfg []*config.RemoteWriteConfig) *e2eobs.Observable {
+func (r *RulerBuilder) InitStateless(internalRuleDir string, queryCfg []clientconfig.Config, remoteWriteCfg []*config.RemoteWriteConfig) *e2eobs.Observable {
 	return r.initRule(internalRuleDir, queryCfg, remoteWriteCfg)
 }
 
-func (r *RulerBuilder) initRule(internalRuleDir string, queryCfg []httpconfig.Config, remoteWriteCfg []*config.RemoteWriteConfig) *e2eobs.Observable {
+func (r *RulerBuilder) initRule(internalRuleDir string, queryCfg []clientconfig.Config, remoteWriteCfg []*config.RemoteWriteConfig) *e2eobs.Observable {
 	if err := os.MkdirAll(r.f.Dir(), 0750); err != nil {
 		return &e2eobs.Observable{Runnable: e2e.NewFailedRunnable(r.Name(), errors.Wrap(err, "create rule dir"))}
 	}
@@ -1193,4 +1238,34 @@ func NewRedis(e e2e.Environment, name string) e2e.Runnable {
 			WaitReadyBackoff: &defaultBackoffConfig,
 		},
 	)
+}
+
+func NewToolsBucketDownsample(e e2e.Environment, name string, bucketConfig client.BucketConfig) *e2eobs.Observable {
+	f := e.Runnable(fmt.Sprintf("downsampler-%s", name)).
+		WithPorts(map[string]int{"http": 8080}).
+		Future()
+
+	bktConfigBytes, err := yaml.Marshal(bucketConfig)
+	if err != nil {
+		return &e2eobs.Observable{Runnable: e2e.NewFailedRunnable(name, errors.Wrapf(err, "generate store config file: %v", bucketConfig))}
+	}
+
+	args := []string{"bucket", "downsample"}
+
+	args = append(args, e2e.BuildArgs(map[string]string{
+		"--http-address":    ":8080",
+		"--log.level":       "debug",
+		"--objstore.config": string(bktConfigBytes),
+		"--data-dir":        f.InternalDir(),
+	})...)
+
+	return e2eobs.AsObservable(f.Init(
+		e2e.StartOptions{
+			Image:            DefaultImage(),
+			Command:          e2e.NewCommand("tools", args...),
+			User:             strconv.Itoa(os.Getuid()),
+			Readiness:        e2e.NewHTTPReadinessProbe("http", "/-/ready", 200, 200),
+			WaitReadyBackoff: &defaultBackoffConfig,
+		},
+	), "http")
 }
