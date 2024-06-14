@@ -12,7 +12,7 @@ interface GraphTabContentProps {
   handleTimeRangeSelection: (startTime: number, endTime: number) => void;
 }
 
-export const GraphTabContent: FC<GraphTabContentProps> = ({ data, stacked, useLocalTime, lastQueryParams, handleTimeRangeSelection }) => {
+export const GraphTabContent: FC<GraphTabContentProps> = ({ data, stacked, useLocalTime, lastQueryParams, handleTimeRangeSelection, }) => {
   if (!isPresent(data)) {
     return <UncontrolledAlert color="light">No data queried yet</UncontrolledAlert>;
   }
